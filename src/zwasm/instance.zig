@@ -670,6 +670,12 @@ fn mapDispatchErr(err: anyerror) Instance.InvokeError {
         error.OutOfHeap => error.OutOfMemory,
         // A host func (e.g. wasi:cli/exit) requested process exit — unwind cleanly.
         error.ProcExit => error.ProcExit,
+        // A WASI `proc_exit` unwinds the interp dispatch loop with the thunk's
+        // `error.WasiExit` (`src/api/wasi.zig::thunkProcExit`); it is the same
+        // clean noreturn termination, so it surfaces as `ProcExit` with the
+        // code recorded on the WASI host — never the panic below (serci Z2:
+        // command guests exit with a value instead of aborting the embedder).
+        error.WasiExit => error.ProcExit,
         else => @panic("zwasm.Instance.invoke: dispatch returned non-Trap error variant"),
     };
 }

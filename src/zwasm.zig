@@ -448,6 +448,22 @@ test {
     _ = @import("api/component_wasi_p2.zig");
     _ = @import("api/component_tests.zig");
     _ = @import("api/component_async_tests.zig");
+    // Native facade (serci Z2): these files carry the Engine/Module/Linker/
+    // Instance/Caller surface tests, but only the `pub const` re-exports above
+    // referenced them — and a re-export does not pull a file's `test` blocks
+    // into this root, so none of them ran under `zig build test`. Load them
+    // explicitly so the facade rows (including Z2's `proc_exit` row) execute.
+    _ = @import("zwasm/engine.zig");
+    _ = @import("zwasm/module.zig");
+    _ = @import("zwasm/linker.zig");
+    _ = @import("zwasm/instance.zig");
+    _ = @import("zwasm/caller.zig");
+    _ = @import("zwasm/memory.zig");
+    _ = @import("zwasm/global.zig");
+    _ = @import("zwasm/table.zig");
+    _ = @import("zwasm/typed_func.zig");
+    _ = @import("zwasm/host_func_marshal.zig");
+    _ = @import("zwasm/value_conv.zig");
     // ADR-0193 P3: the P3 driver + its 28 async tests compile only at
     // `wasi_level >= .p3`. The default `.p2` `zig build test` skips them;
     // the `test-wasi-p3` step (forced `-Dwasi=p3`) covers them.

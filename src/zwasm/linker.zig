@@ -250,6 +250,25 @@ pub const Linker = struct {
         self.wasi_host = h;
     }
 
+    /// Read the exit status a `proc_exit` recorded on this Linker's WASI
+    /// host, if any guest has exited since the last clear. Null when no
+    /// guest through this Linker has exited (the native-facade counterpart
+    /// of the C surface's `activeWasiHost`, scoped to the host this Linker
+    /// owns). The embedder reads this after `Instance.invoke` returns
+    /// `error.ProcExit` (serci Z2: the code travels out-of-band; Zig error
+    /// values carry no payload).
+    pub fn wasiExitCode(self: *const Linker) ?u32 {
+        const h = self.wasi_host orelse return null;
+        return h.exit_code;
+    }
+
+    /// Clear a recorded exit status so the next `wasiExitCode` describes
+    /// the next exit alone (per-call hygiene like `wasm_func_call`'s #341
+    /// clear on the C surface).
+    pub fn clearWasiExitCode(self: *Linker) void {
+        if (self.wasi_host) |h| h.exit_code = null;
+    }
+
     fn destroyForCtx(comptime Ctx: type) *const fn (Allocator, *anyopaque) void {
         return struct {
             fn d(a: Allocator, p: *anyopaque) void {
@@ -904,6 +923,47 @@ test "Linker.defineWasi: WasiConfig.envs populate the host environ (D-177)" {
     try testing.expectEqualStrings("bar", host.envs[0].value);
     try testing.expectEqualStrings("BAZ", host.envs[1].key);
     try testing.expectEqualStrings("qux", host.envs[1].value);
+}
+
+test "Linker proc_exit(3): error.ProcExit plus the recorded exit code (serci Z2)" {
+    // (module (import "wasi_snapshot_preview1" "proc_exit" (func (param i32)))
+    //   (func (export "_start") i32.const 3 call 0))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60,
+        0x01, 0x7f, 0x00, 0x60, 0x00, 0x00, 0x02, 0x24, 0x01, 0x16, 0x77, 0x61,
+        0x73, 0x69, 0x5f, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f,
+        0x70, 0x72, 0x65, 0x76, 0x69, 0x65, 0x77, 0x31, 0x09, 0x70, 0x72, 0x6f,
+        0x63, 0x5f, 0x65, 0x78, 0x69, 0x74, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01,
+        0x07, 0x0a, 0x01, 0x06, 0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x01,
+        0x0a, 0x08, 0x01, 0x06, 0x00, 0x41, 0x03, 0x10, 0x00, 0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    // The native Linker path is interp-pinned (engine selection there is the
+    // Z1 follow-up slice); this row covers the path that panicked at
+    // `mapDispatchErr`'s else branch before the fix. The JIT arm already
+    // returns `error.ProcExit` via `jitTrapToError(.wasi_exit)` and is held
+    // by the `runWasm: proc_exit_42` rows in `src/cli/run.zig`.
+    var lk = eng.linker();
+    defer lk.deinit();
+    try lk.defineWasi(.{});
+    try testing.expectEqual(@as(?u32, null), lk.wasiExitCode());
+    var inst = try lk.instantiate(&mod, .{});
+    defer inst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.interp, inst.engine());
+    var results = [_]_zwasm.Value{};
+    try testing.expectError(error.ProcExit, inst.invoke("_start", &.{}, &results));
+    try testing.expectEqual(@as(?u32, 3), lk.wasiExitCode());
+    // The host is intact: clearing the status leaves a usable linker, and a
+    // second instance through it exits the same way (B2: the host goes on).
+    lk.clearWasiExitCode();
+    try testing.expectEqual(@as(?u32, null), lk.wasiExitCode());
+    var inst2 = try lk.instantiate(&mod, .{});
+    defer inst2.deinit();
+    try testing.expectError(error.ProcExit, inst2.invoke("_start", &.{}, &results));
+    try testing.expectEqual(@as(?u32, 3), lk.wasiExitCode());
 }
 
 test "Linker.defineWasi: WasiConfig.preopens materialise into the host at instantiate (D-177)" {
