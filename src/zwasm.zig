@@ -464,6 +464,7 @@ test {
     _ = @import("zwasm/typed_func.zig");
     _ = @import("zwasm/host_func_marshal.zig");
     _ = @import("zwasm/value_conv.zig");
+    _ = @import("api/jit_host_bridge.zig");
     // ADR-0193 P3: the P3 driver + its 28 async tests compile only at
     // `wasi_level >= .p3`. The default `.p2` `zig build test` skips them;
     // the `test-wasi-p3` step (forced `-Dwasi=p3`) covers them.

@@ -18,11 +18,14 @@
 //! **GP-scalar collapse**: i32 and i64 wasm args both occupy a single integer
 //! arg register, so a thunk declaring `u64` params receives BOTH correctly; the
 //! bridge marshals each per `payload.params[i]` (i32 → low 32 bits). This avoids
-//! a per-arg-type table — coverage is (arity 0..4 × result {void,i32,i64} ×
-//! slot). FP args/results (f32/f64) live in a SEPARATE register class and need
-//! positionally-typed thunks (a later increment); a signature with any FP /
-//! v128 / ref / >4 args is rejected at JIT instantiate (`instance.zig` →
-//! `.interp` fallback), never silently mis-dispatched.
+//! a per-arg-type table — coverage is (all-GP arity 0..6, or ≤2 scalar args
+//! with ≥1 FP) × result {void,i32,i64,f32,f64} × slot. FP args/results (f32/f64)
+//! live in a SEPARATE register class and need positionally-typed thunks; a
+//! signature with any v128 / ref, >6 GP args, or FP args beyond arity 2 is
+//! rejected at JIT instantiate (→ `.interp` fallback), never silently
+//! mis-dispatched. All-GP arity 5..6 keeps every arg in a register on
+//! SysV/arm64; on Win64 the tail spills to the stack, which `callconv(.c)`
+//! still receives correctly (slower, not wrong).
 //!
 //! Zone 3 (`src/api/`): touches `HostFuncPayload` + the `wasm_val_t` ABI. Only
 //! the planted fn-ptr (an opaque `usize`) crosses into Zone 2 setup.
@@ -46,9 +49,11 @@ const Trap = trap_surface.Trap;
 /// instantiate.
 pub const MAX_HOST_SLOTS = 64;
 
-/// Max host-func arity the GP-scalar bridge covers (≤4 keeps every arg in a
-/// register on each ABI; >4 would stack-spill and is rejected → `.interp`).
-const MAX_ARITY = 4;
+/// Max host-func arity the GP-scalar bridge covers. 0..4 keeps every arg in a
+/// register on every ABI; 5..6 is the serci-Z1 extension for the S16.3
+/// `host_request` shape (5×i32): still all-register on SysV/arm64, stack tail
+/// on Win64 (correct via `callconv(.c)`). Past 6 → `.interp`.
+const MAX_ARITY = 6;
 
 /// Result kinds the bridge covers (all four scalar Wasm types + void). v128/ref
 /// results are uncovered (→ `.interp`).
@@ -217,6 +222,22 @@ fn t4(comptime K: usize, comptime r: RetKind) *const fn (*JitRuntime, u64, u64, 
         }
     }.f;
 }
+fn t5(comptime K: usize, comptime r: RetKind) *const fn (*JitRuntime, u64, u64, u64, u64, u64) callconv(.c) RT(r) {
+    return &struct {
+        fn f(rt: *JitRuntime, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) callconv(.c) RT(r) {
+            const a = [_]u64{ a0, a1, a2, a3, a4 };
+            return bridge(rt, K, &a, r);
+        }
+    }.f;
+}
+fn t6(comptime K: usize, comptime r: RetKind) *const fn (*JitRuntime, u64, u64, u64, u64, u64, u64) callconv(.c) RT(r) {
+    return &struct {
+        fn f(rt: *JitRuntime, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) callconv(.c) RT(r) {
+            const a = [_]u64{ a0, a1, a2, a3, a4, a5 };
+            return bridge(rt, K, &a, r);
+        }
+    }.f;
+}
 
 // FP-arg thunk generators (arity 1..2). Each position is typed by its
 // register-class `Kind` so the C ABI lands GP args in integer registers and
@@ -267,7 +288,7 @@ fn buildTable(comptime gen: anytype, comptime r: RetKind) Table(@TypeOf(gen(0, r
 }
 
 /// Raw fn-ptr (as `usize`) for the all-GP arity-`N` thunk of result kind `r` at
-/// slot `idx`. `gen` is the per-arity GP thunk generator (t0..t4).
+/// slot `idx`. `gen` is the per-arity GP thunk generator (t0..t6).
 fn ptrFor(comptime gen: anytype, r: RetKind, idx: usize) usize {
     inline for (std.meta.fields(RetKind)) |rf| {
         if (r == @field(RetKind, rf.name)) {
@@ -330,9 +351,9 @@ fn fpPtr2(k0: Kind, k1: Kind, r: RetKind, idx: usize) usize {
 /// The dispatch fn-ptr (as a raw `usize`, planted into `host_dispatch_base[idx]`)
 /// for a host-func import of signature `(params)->(results)` at func-import slot
 /// `idx`, or null if the bridge does not cover this signature (caller rejects
-/// the JIT instantiate → `.interp`). Covers: all-GP (i32/i64) args 0..4, OR
+/// the JIT instantiate → `.interp`). Covers: all-GP (i32/i64) args 0..6, OR
 /// ≤2 scalar args with ≥1 FP (f32/f64), each with a {void,i32,i64,f32,f64}
-/// result. >4 args, FP args beyond arity 2, or any v128/ref param/result → null.
+/// result. >6 args, FP args beyond arity 2, or any v128/ref param/result → null.
 pub fn dispatchPtrFor(params: []const zir.ValType, results: []const zir.ValType, idx: usize) ?usize {
     if (idx >= MAX_HOST_SLOTS) return null;
     const r = retKind(results) orelse return null;
@@ -349,6 +370,8 @@ pub fn dispatchPtrFor(params: []const zir.ValType, results: []const zir.ValType,
             2 => ptrFor(t2, r, idx),
             3 => ptrFor(t3, r, idx),
             4 => ptrFor(t4, r, idx),
+            5 => ptrFor(t5, r, idx),
+            6 => ptrFor(t6, r, idx),
             else => null,
         };
     }
@@ -358,4 +381,19 @@ pub fn dispatchPtrFor(params: []const zir.ValType, results: []const zir.ValType,
         2 => fpPtr2(vtKind(params[0]).?, vtKind(params[1]).?, r, idx),
         else => null,
     };
+}
+
+test "dispatchPtrFor: all-GP arity 5..6 covered, 7 declined (serci Z1)" {
+    const five = [_]zir.ValType{ .i32, .i32, .i32, .i32, .i32 };
+    const six = [_]zir.ValType{ .i64, .i64, .i64, .i64, .i64, .i64 };
+    const seven = [_]zir.ValType{.i32} ** 7;
+    const r32 = [_]zir.ValType{.i32};
+    // The S16.3 `host_request` shape (5×i32)->i32 resolves a thunk now.
+    try std.testing.expect(dispatchPtrFor(&five, &r32, 0) != null);
+    try std.testing.expect(dispatchPtrFor(&six, &.{}, 1) != null);
+    // Past the extended cover, and past the slot table, still decline.
+    try std.testing.expect(dispatchPtrFor(&seven, &.{}, 0) == null);
+    try std.testing.expect(dispatchPtrFor(&five, &r32, MAX_HOST_SLOTS) == null);
+    // Distinct slots resolve distinct thunks (no aliasing across K).
+    try std.testing.expect(dispatchPtrFor(&five, &r32, 0).? != dispatchPtrFor(&five, &r32, 1).?);
 }

@@ -12,6 +12,7 @@ const extern_new = @import("extern_new.zig");
 const types = @import("types.zig");
 const vec = @import("vec.zig");
 const trap_surface = @import("trap_surface.zig");
+const handles = @import("handles.zig");
 const runner = @import("../engine/runner.zig");
 
 fn inTable(table: []const []const u8, name: []const u8) bool {
@@ -211,4 +212,77 @@ test ".jit: a defined start that traps is Final with the trap's own kind (#233)"
         defer trap_surface.wasm_trap_delete(t);
         try testing.expectEqual(trap_surface.TrapKind.unreachable_, t.kind);
     }
+}
+
+fn add5Callback(args: ?*const vec.ValVec, results: ?*vec.ValVec) callconv(.c) ?*trap_surface.Trap {
+    var sum: i32 = 0;
+    const argv = args.?.data.?[0..args.?.size];
+    for (argv) |v| sum += v.of.i32;
+    results.?.data.?[0].of.i32 = sum;
+    results.?.data.?[0].kind = .i32;
+    return null;
+}
+
+test ".jit: a 5-arg host import instantiates on the JIT and computes (serci Z1)" {
+    // (module (import "env" "add5" (func (param i32 i32 i32 i32 i32) (result i32)))
+    //   (func (export "run") (result i32)
+    //     i32.const 1 i32.const 2 i32.const 3 i32.const 4 i32.const 5 call 0))
+    // Byte-exact against wat2wasm (see WP-1B findings); the bridge used to
+    // decline arity 5, so `.jit` came back null and `.auto` hid on `.interp`.
+    const add5_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0e, 0x02, 0x60,
+        0x05, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f,
+        0x02, 0x0c, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x04, 0x61, 0x64, 0x64, 0x35,
+        0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07, 0x07, 0x01, 0x03, 0x72, 0x75,
+        0x6e, 0x00, 0x01, 0x0a, 0x10, 0x01, 0x0e, 0x00, 0x41, 0x01, 0x41, 0x02,
+        0x41, 0x03, 0x41, 0x04, 0x41, 0x05, 0x10, 0x00, 0x0b,
+    };
+    const e = instance.wasm_engine_new() orelse return error.EngineAllocFailed;
+    defer instance.wasm_engine_delete(e);
+    const st = instance.wasm_store_new(e) orelse return error.StoreAllocFailed;
+    defer instance.wasm_store_delete(st);
+
+    var pdefs = [_]?*types.ValType{
+        types.wasm_valtype_new(0), types.wasm_valtype_new(0),
+        types.wasm_valtype_new(0), types.wasm_valtype_new(0),
+        types.wasm_valtype_new(0),
+    };
+    var rdefs = [_]?*types.ValType{types.wasm_valtype_new(0)};
+    var pv: types.ValTypeVec = undefined;
+    var rv: types.ValTypeVec = undefined;
+    types.wasm_valtype_vec_new(&pv, pdefs.len, &pdefs);
+    types.wasm_valtype_vec_new(&rv, rdefs.len, &rdefs);
+    const ft = types.wasm_functype_new(&pv, &rv) orelse return error.FuncTypeAllocFailed;
+    defer types.wasm_functype_delete(ft);
+    const hf = extern_new.wasm_func_new(st, ft, add5Callback) orelse return error.FuncNewFailed;
+    defer instance.wasm_func_delete(hf);
+
+    var bytes = add5_wasm;
+    const bv: vec.ByteVec = .{ .size = bytes.len, .data = &bytes };
+    const m = instance.wasm_module_new(st, &bv) orelse return error.ModuleAllocFailed;
+    defer instance.wasm_module_delete(m);
+    var iarr = [_]?*instance.Extern{extern_new.wasm_func_as_extern(hf)};
+    var imports: vec.ExternVec = .{ .size = iarr.len, .data = &iarr };
+
+    var trap: ?*trap_surface.Trap = null;
+    const i = instance.instanceNewWithEngine(st, m, &imports, &trap, .jit) orelse return error.JitDeclined;
+    defer instance.wasm_instance_delete(i);
+    try testing.expect(trap == null);
+    // Without this a silent `.interp` fallback would make the call below vacuous.
+    try testing.expect(i.jit != null);
+
+    var exports: vec.ExternVec = .{ .size = 0, .data = null };
+    instance.wasm_instance_exports(i, &exports);
+    defer instance.wasm_extern_vec_delete(&exports);
+    try testing.expectEqual(@as(usize, 1), exports.size);
+    const run = instance.wasm_extern_as_func(exports.data.?[0]) orelse return error.NotFunc;
+
+    const no_args: vec.ValVec = .{ .size = 0, .data = null };
+    var rdata = [_]handles.Val{.{ .kind = .i32, .of = .{ .i32 = 0 } }};
+    var resvec: vec.ValVec = .{ .size = 1, .data = &rdata };
+    const ctrap = instance.wasm_func_call(run, &no_args, &resvec);
+    defer if (ctrap) |t| trap_surface.wasm_trap_delete(t);
+    try testing.expect(ctrap == null);
+    try testing.expectEqual(handles.ValKind.i32, rdata[0].kind);
+    try testing.expectEqual(@as(i32, 15), rdata[0].of.i32);
 }
