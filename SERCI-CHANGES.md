@@ -9,6 +9,26 @@ critical path. Fork commits follow serci S60 (`fork(...)` type, PR link in the
 body). The invariant is wasm-compatibility: RT0 (core spec `testsuite` on both
 engines) and RT1 (wasmtime-vs-fork differential) stay green.
 
+## Z5 — compiled-module artifacts on the native facade: produce + load gate
+
+- Status: landed on `fork/z5-artifact-cache`; upstream PR:
+  https://github.com/zwasm/zwasm/pull/473.
+- What: the fork could produce `.cwasm` only through the CLI (`compile`/`run --cache`);
+  embedders had no serialize API and no cheap validity gate (serci S42 Z5). New
+  `src/zwasm/artifact.zig`: `Artifact.produce(gpa, eng, wasm_bytes)` validates through
+  `Engine.compile`, runs the JIT pipeline (`compileWasmForAot`), and returns owned
+  `.cwasm` bytes; `Artifact.isValid` is the cheap load gate (magic / format version /
+  this host's arch / every section inside the entry).
+- Scope: produce-only on this surface. Consuming an artifact through
+  `Engine.compile`/`Linker.instantiate` needs `Module` to carry deserialized codegen
+  past the C ABI — upstream-scale surgery tracked as the follow-up; the runner
+  (`runWasiLenientArgs`) already consumes artifacts, and the tests prove an artifact
+  runs identically to a fresh compile through it.
+- Tests: produce → valid → same `run` answer (42) via the CWAS path as via fresh
+  compile; invalid input never reaches codegen (`ParseFailed`); gate refuses garbage,
+  truncation, version drift, and arch drift. Full suite: 3373 passed, 12 skipped.
+- Compatibility: pure addition (one re-export + one test-loader line). RT0/RT1 unaffected.
+
 ## Z4 — instance checkpoint/restore: linear pages + globals + tables to bytes and back
 
 - Status: landed on `fork/z4-checkpoint-restore`; upstream PR:

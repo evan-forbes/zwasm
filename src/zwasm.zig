@@ -61,6 +61,7 @@ pub const Table = @import("zwasm/table.zig").Table;
 pub const Linker = @import("zwasm/linker.zig").Linker;
 pub const Caller = @import("zwasm/caller.zig").Caller;
 pub const Checkpoint = @import("zwasm/checkpoint.zig");
+pub const Artifact = @import("zwasm/artifact.zig");
 
 /// Zig-idiomatic tagged-union mirror of `wasm_val_t`.
 /// Wasm spec §4.2.2 — value representation at the host boundary
@@ -466,6 +467,7 @@ test {
     _ = @import("zwasm/host_func_marshal.zig");
     _ = @import("zwasm/value_conv.zig");
     _ = @import("zwasm/checkpoint.zig");
+    _ = @import("zwasm/artifact.zig");
     _ = @import("api/jit_host_bridge.zig");
     // ADR-0193 P3: the P3 driver + its 28 async tests compile only at
     // `wasi_level >= .p3`. The default `.p2` `zig build test` skips them;
