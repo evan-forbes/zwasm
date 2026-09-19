@@ -597,6 +597,10 @@ pub const Linker = struct {
         const imp_section = mod.native.find(.import);
         var bindings_list: std.ArrayList(_runtime_import.ImportBinding) = .empty;
         defer bindings_list.deinit(scratch);
+        // serci Z1b: whether the module imports WASI. The JIT plants WASI
+        // dispatch from the STORE host while the Linker owns its host, so a
+        // WASI-importing module stays interp until the store-plant slice lands.
+        var saw_wasi = false;
 
         if (imp_section) |sec| {
             var decoded = _sections.decodeImports(scratch, sec.body) catch return error.InstantiateFailed;
@@ -622,6 +626,16 @@ pub const Linker = struct {
                 // `wasi_snapshot_preview1` import resolves through
                 // the registered host even if no entry was added
                 // via defineFunc.
+                // Mirrors the JIT's planted set (`jit_dispatch.lookup`: preview1 +
+                // wasi_unstable); either one must stay interp on the Linker path.
+                // Kept OUT of the shortcut branch below: `wasi_unstable` does not
+                // link today (UnknownImport), and widening that is not this slice.
+                if (it.kind == .func and
+                    (std.mem.eql(u8, it.module, "wasi_snapshot_preview1") or
+                        std.mem.eql(u8, it.module, "wasi_unstable")))
+                {
+                    saw_wasi = true;
+                }
                 if (std.mem.eql(u8, it.module, "wasi_snapshot_preview1")) {
                     if (it.kind != .func) return error.ImportKindMismatch;
                     const host = self.wasi_host orelse return error.UnknownImport;
@@ -815,12 +829,26 @@ pub const Linker = struct {
         // trap_out=null: the Linker path keeps the coarse InstantiateFailed for
         // a start trap (its rich LinkError covers the import-resolution failures);
         // surfacing a start trap here is a follow-up if a consumer needs it (D-275).
-        // ADR-0200 / D-496 — the Linker path stays INTERP-pinned even after the
-        // `.auto`→JIT flip: cross-module func/global/table/memory aliasing +
-        // component graph wiring are interp-runtime invariants (the JIT instance
-        // exposes accessors but not the cross-instance aliasing the Linker builds).
-        // Engine selection on the Linker is a separate follow-up slice.
-        const inst_ptr = _api_instance.instantiateInternal(mod.c_store, mod.c_handle, pre.asBuilder(), null, limits, .interp) orelse return error.InstantiateFailed;
+        // serci Z1b — the Linker no longer ignores `opts.engine` (ADR-0200 /
+        // D-496 follow-up, first increment): explicit `.jit` / `.interp` are
+        // honored, and `.auto` keeps the INTERP default (pre-Z1b behavior for
+        // every in-tree caller) until the follow-up slices land. Rationale: the
+        // JIT declines what it cannot serve (non-func imports, cross-module
+        // thunks, marshal-thunk host funcs), but two Linker shapes would NOT
+        // decline — they would silently run wrong. A WASI-importing module
+        // would plant dispatch from the STORE host (null → stub syscalls, D-451)
+        // while the Linker owns its host, so `.auto` forces those to interp
+        // (`saw_wasi`) and explicit `.jit` refuses them LOUDLY rather than
+        // stub-running them. Routing Linker host funcs and the Linker-owned
+        // WASI host into the JIT needs a JIT-backed Caller + the store-plant
+        // slice — until then `.auto` is interp and `.jit` is require-semantics.
+        if (opts.engine == .jit and saw_wasi) return error.InstantiateFailed;
+        const engine: _api_instance.EngineKind = switch (opts.engine) {
+            .interp => .interp,
+            .auto => .interp,
+            .jit => .jit,
+        };
+        const inst_ptr = _api_instance.instantiateInternal(mod.c_store, mod.c_handle, pre.asBuilder(), null, limits, engine) orelse return error.InstantiateFailed;
         return .{ .handle = inst_ptr, .c_store = mod.c_store };
     }
 
@@ -964,6 +992,114 @@ test "Linker proc_exit(3): error.ProcExit plus the recorded exit code (serci Z2)
     defer inst2.deinit();
     try testing.expectError(error.ProcExit, inst2.invoke("_start", &.{}, &results));
     try testing.expectEqual(@as(?u32, 3), lk.wasiExitCode());
+}
+
+test "Linker engine select (serci Z1b): .auto keeps the interp default" {
+    // (module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+        0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01,
+        0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x0a, 0x09,
+        0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a,
+        0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    // No imports, so no bindings: `.auto` keeps pre-Z1b behavior (interp)
+    // until the WASI-host + component-wiring slices land (D-496).
+    var inst = try lk.instantiate(&mod, .{ .engine = .auto });
+    defer inst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.interp, inst.engine());
+    var results = [_]_zwasm.Value{.{ .i32 = 0 }};
+    try inst.invoke("add", &.{ .{ .i32 = 2 }, .{ .i32 = 3 } }, &results);
+    try testing.expectEqual(@as(i32, 5), results[0].i32);
+}
+
+test "Linker engine select (serci Z1b): explicit .jit reports jit on an import-free module" {
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+        0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01,
+        0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x0a, 0x09,
+        0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a,
+        0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    // The jit assert: the Linker path reaches the JIT and computes there.
+    var inst = try lk.instantiate(&mod, .{ .engine = .jit });
+    defer inst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.jit, inst.engine());
+    var results = [_]_zwasm.Value{.{ .i32 = 0 }};
+    try inst.invoke("add", &.{ .{ .i32 = 2 }, .{ .i32 = 3 } }, &results);
+    try testing.expectEqual(@as(i32, 5), results[0].i32);
+}
+
+test "Linker engine select (serci Z1b): explicit .interp still pins the interpreter" {
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+        0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01,
+        0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x0a, 0x09,
+        0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a,
+        0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    var inst = try lk.instantiate(&mod, .{ .engine = .interp });
+    defer inst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.interp, inst.engine());
+}
+
+test "Linker engine select (serci Z1b): host-func import declines (.auto) / refuses (.jit)" {
+    // (module (type (func (param i32) (result i32))) (import "env" "id" (func (type 0)))
+    //         (func (export "f") (param i32) (result i32) local.get 0 call 0))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+        0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x02,
+        0x69, 0x64, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00,
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x01, 0x0a,
+        0x08, 0x01, 0x06, 0x00, 0x20, 0x00, 0x10, 0x00,
+        0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    const H = struct {
+        fn id(caller: *Caller, x: i32) i32 {
+            _ = caller;
+            return x;
+        }
+    };
+    try lk.defineFunc("env", "id", fn (*Caller, i32) i32, H.id);
+    // The native marshal thunk is not a JIT-bridge payload: `.auto` declines
+    // to the interpreter (computes there), `.jit` requires the JIT and fails
+    // LOUDLY instead of mis-dispatching. Routing Linker host funcs into the
+    // JIT needs a JIT-backed Caller — the next Z1 slice.
+    var inst = try lk.instantiate(&mod, .{ .engine = .auto });
+    defer inst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.interp, inst.engine());
+    var results = [_]_zwasm.Value{.{ .i32 = 0 }};
+    try inst.invoke("f", &.{.{ .i32 = 41 }}, &results);
+    try testing.expectEqual(@as(i32, 41), results[0].i32);
+    try testing.expectError(error.InstantiateFailed, lk.instantiate(&mod, .{ .engine = .jit }));
 }
 
 test "Linker.defineWasi: WasiConfig.preopens materialise into the host at instantiate (D-177)" {

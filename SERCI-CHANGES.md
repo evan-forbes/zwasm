@@ -57,3 +57,30 @@ engines) and RT1 (wasmtime-vs-fork differential) stay green.
   it through `instantiateJit`; arities past 6 and FP past 2 still decline.
 - Compatibility: strictly widens JIT acceptance; every module that compiled
   before compiles identically, and declines remain declines.
+
+## Z1b — `Linker.instantiate` honors `opts.engine` (serci Z1, second increment)
+
+- Status: on `fork/z1b-linker-engine`; upstream PR: https://github.com/zwasm/zwasm/pull/469.
+- What: the native `Linker.instantiate` hardcoded `.interp` when calling
+  `instantiateInternal`, ignoring `opts.engine` (the interp pin). Explicit
+  `.jit` / `.interp` are now honored; `.auto` keeps the interp default.
+- Scope deliberately narrow (ADR-0200 / D-496): `.auto` does NOT try the JIT
+  on the Linker path yet. Two Linker shapes would not decline but silently
+  run wrong under a JIT attempt — a WASI-importing module (the JIT plants
+  WASI dispatch from the STORE host, null → stub syscalls per D-451, while
+  the Linker owns its host) and the in-tree callers that unwrap
+  `instance.handle.runtime` (interp-only, e.g. the 10.G-foundation
+  `gc_heap` row, which crashed on the first unpin attempt). So `.auto`
+  forces WASI-importing modules (`wasi_snapshot_preview1` + `wasi_unstable`,
+  mirroring `jit_dispatch.lookup`) to interp, and explicit `.jit` on such a
+  module refuses LOUDLY (`error.InstantiateFailed`) instead of stub-running.
+  Routing Linker host funcs (native marshal thunks, not JIT-bridge payloads)
+  and the Linker-owned WASI host into the JIT needs a JIT-backed `Caller` +
+  the store-plant slice — the next Z1 increment, not this one.
+- Tests: four `Linker engine select` rows in `src/zwasm/linker.zig` —
+  `.auto` stays interp, explicit `.jit` on an import-free module reports
+  `jit` and computes, explicit `.interp` pins, and a `defineFunc` host
+  import declines to interp under `.auto` (computes) while `.jit` requires
+  the JIT and fails loud. Full suite: 3357 passed, 12 skipped (`zig build test`); `test-all` green.
+- Compatibility: default (`.auto`) behavior is byte-identical to pre-Z1b;
+  only an explicit `.jit` can observe the new path.
