@@ -456,7 +456,9 @@ pub const Instance = struct {
 
     /// ADR-0200 — cast the Zone-1 `Instance.jit` opaque slot to the engine type
     /// at the Zone-3 boundary. Null for an interp-backed (or empty) instance.
-    fn jitHandle(self: *Instance) ?*_runner.JitInstance {
+    /// Z4 checkpoint/restore reaches the JIT handle through the same
+    /// boundary cast as the engine arms above.
+    pub fn jitHandle(self: *Instance) ?*_runner.JitInstance {
         const jp = self.handle.jit orelse return null;
         return @ptrCast(@alignCast(jp));
     }

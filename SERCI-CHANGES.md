@@ -9,6 +9,30 @@ critical path. Fork commits follow serci S60 (`fork(...)` type, PR link in the
 body). The invariant is wasm-compatibility: RT0 (core spec `testsuite` on both
 engines) and RT1 (wasmtime-vs-fork differential) stay green.
 
+## Z4 — instance checkpoint/restore: linear pages + globals + tables to bytes and back
+
+- Status: landed on `fork/z4-checkpoint-restore`; upstream PR:
+  https://github.com/zwasm/zwasm/pull/472.
+- What: the fork had no snapshot API (only live `Memory` views), so a kernel's
+  namespace could not survive a process restart or a child fork without language
+  support (serci S42 Z4). New `src/zwasm/checkpoint.zig`: `checkpoint(gpa,
+  inst, wasm_bytes)` serialises linear-memory pages, globals (raw 16-byte
+  cells, valtype-agnostic), tables (funcref as function-space indices resolved
+  through the instance's own entity array, externref as raw u64 handles),
+  data/elem dropped flags, and remaining fuel into versioned bytes
+  (`ZCHKPT01`, blake3 module identity); `restoreInto(inst, wasm_bytes, bytes)`
+  grows a fresh same-module/same-engine instance up to the recorded sizes and
+  overwrites every cell, including the JIT funcptr/typeidx mirrors.
+- Scope refusals (loud, never silent divergence): imported memories/globals/
+  tables (alias another instance), multi-memory modules, non-funcref/externref
+  table types. Externref restores are same-process only (documented).
+- Tests: 11 rows in `src/zwasm/checkpoint.zig` — memory+global continuation,
+  funcref `call_indirect` targets (incl. JIT mirrors), externref round-trip,
+  import scan, and engine/module/truncation/trailing refusals — on `.interp`
+  and `.jit`. Full suite: 121/121.
+- Compatibility: pure addition (one `pub` on `Instance.jitHandle`, one
+  re-export, one test-loader line). RT0/RT1 unaffected.
+
 ## Z2 — `proc_exit` from a command guest returns `error.ProcExit`, not a panic
 
 - Status: landed on `fork/z2-proc-exit-trap`; upstream PR:
