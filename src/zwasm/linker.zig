@@ -22,6 +22,7 @@ const Allocator = std.mem.Allocator;
 const dbg = @import("../support/dbg.zig");
 
 const _api_instance = @import("../api/instance.zig");
+const _handles = @import("../api/handles.zig");
 const _api_wasi = @import("../api/wasi.zig");
 const _cross_module = @import("../api/cross_module.zig");
 const _sections = @import("../parse/sections.zig");
@@ -147,6 +148,15 @@ pub const Linker = struct {
         ctx: *anyopaque,
         params: []const _zir.ValType,
         results: []const _zir.ValType,
+        /// serci Z1c — per-entry JIT-bridge payload (`callback_jit` adapter
+        /// + this entry's ctx as `env`), Linker-owned like `ctx`. An
+        /// explicit-`.jit` `instantiate` plants `{ hostFuncThunk,
+        /// jit_payload }` so the JIT path serves the import through the
+        /// bridge with a JIT-backed `Caller`; `.auto` / `.interp` keep the
+        /// marshal-thunk bindings above. The payload is immutable after
+        /// `defineFunc`, so sharing it across instances is sound: per-call
+        /// state (the `Caller`) is built from the bridge's live `*JitRuntime`.
+        jit_payload: *_handles.HostFuncPayload,
     };
 
     pub const MemoryAlias = struct {
@@ -323,13 +333,28 @@ pub const Linker = struct {
         const Ctx = _marshal.HostFnCtx(Sig);
         const ctx_ptr = try self.engine.alloc.create(Ctx);
         errdefer self.engine.alloc.destroy(ctx_ptr);
-        ctx_ptr.* = .{ .user_fn = user_fn, .host_data = host_data };
+        ctx_ptr.* = .{ .user_fn = user_fn, .host_data = host_data, .jit_alloc = self.engine.alloc };
         try self.ctx_storage.append(self.engine.alloc, .{
             .ptr = ctx_ptr,
             .destroy_fn = destroyForCtx(Ctx),
         });
 
         const sig = comptime _marshal.signatureOf(Sig);
+        // serci Z1c — the JIT-bridge payload for this entry (Linker-owned;
+        // the `params` / `results` slices are entry-stable, only read by the
+        // bridge at instantiate, so the const-cast is sound).
+        const payload_ptr = try self.engine.alloc.create(_handles.HostFuncPayload);
+        errdefer self.engine.alloc.destroy(payload_ptr);
+        payload_ptr.* = .{
+            .callback_jit = _marshal.jitAdapterFor(Sig),
+            .env = ctx_ptr,
+            .params = @constCast(sig.params),
+            .results = @constCast(sig.results),
+        };
+        try self.ctx_storage.append(self.engine.alloc, .{
+            .ptr = payload_ptr,
+            .destroy_fn = destroyForCtx(_handles.HostFuncPayload),
+        });
         try self.entries.append(self.engine.alloc, .{
             .module = module,
             .name = name,
@@ -338,6 +363,7 @@ pub const Linker = struct {
                 .ctx = ctx_ptr,
                 .params = sig.params,
                 .results = sig.results,
+                .jit_payload = payload_ptr,
             } },
         });
     }
@@ -366,10 +392,27 @@ pub const Linker = struct {
             .host_data = host_data,
             .n_params = params.len,
             .n_results = results.len,
+            .result_types = results,
+            .jit_alloc = self.engine.alloc,
         };
         try self.ctx_storage.append(self.engine.alloc, .{
             .ptr = ctx_ptr,
             .destroy_fn = destroyForCtx(_marshal.RawHostFnCtx),
+        });
+        // serci Z1c — the JIT-bridge payload (same contract as above; the
+        // caller-owned `params` / `results` slices only need to outlive the
+        // Linker, per `defineFuncRaw`'s existing contract).
+        const payload_ptr = try self.engine.alloc.create(_handles.HostFuncPayload);
+        errdefer self.engine.alloc.destroy(payload_ptr);
+        payload_ptr.* = .{
+            .callback_jit = _marshal.rawJitAdapter,
+            .env = ctx_ptr,
+            .params = @constCast(params),
+            .results = @constCast(results),
+        };
+        try self.ctx_storage.append(self.engine.alloc, .{
+            .ptr = payload_ptr,
+            .destroy_fn = destroyForCtx(_handles.HostFuncPayload),
         });
         try self.entries.append(self.engine.alloc, .{
             .module = module,
@@ -379,6 +422,7 @@ pub const Linker = struct {
                 .ctx = ctx_ptr,
                 .params = params,
                 .results = results,
+                .jit_payload = payload_ptr,
             } },
         });
     }
@@ -667,9 +711,22 @@ pub const Linker = struct {
                                     if (dbg.on("link.trace")) std.debug.print("[link] SignatureMismatch: {s}::{s}\n", .{ it.module, it.name });
                                     return error.SignatureMismatch;
                                 }
+                                // serci Z1c — explicit `.jit` plants the JIT-bridge
+                                // marker + this entry's payload instead of the
+                                // native marshal thunk, so the JIT path serves
+                                // the import with a JIT-backed `Caller`
+                                // (`collectFuncImportTargets` routes
+                                // `hostFuncThunk`-marked bindings through
+                                // `dispatchPtrFor`). `.auto` / `.interp` keep
+                                // the marshal-thunk bindings (pre-Z1c
+                                // behavior, byte-identical).
+                                const hc: _runtime.HostCall = if (opts.engine == .jit)
+                                    .{ .fn_ptr = _api_instance.hostFuncThunk, .ctx = @ptrCast(host.jit_payload) }
+                                else
+                                    .{ .fn_ptr = host.thunk_fn, .ctx = host.ctx };
                                 bindings_list.append(scratch, .{
                                     .func = .{
-                                        .host_call = .{ .fn_ptr = host.thunk_fn, .ctx = host.ctx },
+                                        .host_call = hc,
                                         .source = .wasi,
                                     },
                                 }) catch return error.OutOfMemory;
@@ -834,14 +891,15 @@ pub const Linker = struct {
         // honored, and `.auto` keeps the INTERP default (pre-Z1b behavior for
         // every in-tree caller) until the follow-up slices land. Rationale: the
         // JIT declines what it cannot serve (non-func imports, cross-module
-        // thunks, marshal-thunk host funcs), but two Linker shapes would NOT
-        // decline — they would silently run wrong. A WASI-importing module
+        // thunks, host funcs past the bridge cover), but one Linker shape would
+        // NOT decline — it would silently run wrong. A WASI-importing module
         // would plant dispatch from the STORE host (null → stub syscalls, D-451)
         // while the Linker owns its host, so `.auto` forces those to interp
         // (`saw_wasi`) and explicit `.jit` refuses them LOUDLY rather than
-        // stub-running them. Routing Linker host funcs and the Linker-owned
-        // WASI host into the JIT needs a JIT-backed Caller + the store-plant
-        // slice — until then `.auto` is interp and `.jit` is require-semantics.
+        // stub-running them. Linker host funcs inside the bridge cover ride
+        // the JIT since Z1c (JIT-backed `Caller`); the Linker-owned WASI host
+        // still needs the store-plant slice — until then `.auto` is interp
+        // and `.jit` is require-semantics for WASI.
         if (opts.engine == .jit and saw_wasi) return error.InstantiateFailed;
         const engine: _api_instance.EngineKind = switch (opts.engine) {
             .interp => .interp,
@@ -1064,7 +1122,7 @@ test "Linker engine select (serci Z1b): explicit .interp still pins the interpre
     try testing.expectEqual(_api_instance.EngineKind.interp, inst.engine());
 }
 
-test "Linker engine select (serci Z1b): host-func import declines (.auto) / refuses (.jit)" {
+test "Linker engine select (serci Z1c): host-func import runs on the JIT" {
     // (module (type (func (param i32) (result i32))) (import "env" "id" (func (type 0)))
     //         (func (export "f") (param i32) (result i32) local.get 0 call 0))
     const bytes = [_]u8{
@@ -1089,17 +1147,216 @@ test "Linker engine select (serci Z1b): host-func import declines (.auto) / refu
         }
     };
     try lk.defineFunc("env", "id", fn (*Caller, i32) i32, H.id);
-    // The native marshal thunk is not a JIT-bridge payload: `.auto` declines
-    // to the interpreter (computes there), `.jit` requires the JIT and fails
-    // LOUDLY instead of mis-dispatching. Routing Linker host funcs into the
-    // JIT needs a JIT-backed Caller — the next Z1 slice.
+    // `.auto` stays interp (computes there); explicit `.jit` routes the
+    // import through the JIT host bridge with a JIT-backed `Caller`.
     var inst = try lk.instantiate(&mod, .{ .engine = .auto });
     defer inst.deinit();
     try testing.expectEqual(_api_instance.EngineKind.interp, inst.engine());
     var results = [_]_zwasm.Value{.{ .i32 = 0 }};
     try inst.invoke("f", &.{.{ .i32 = 41 }}, &results);
     try testing.expectEqual(@as(i32, 41), results[0].i32);
+    var jinst = try lk.instantiate(&mod, .{ .engine = .jit });
+    defer jinst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.jit, jinst.engine());
+    var jresults = [_]_zwasm.Value{.{ .i32 = 0 }};
+    try jinst.invoke("f", &.{.{ .i32 = 41 }}, &jresults);
+    try testing.expectEqual(@as(i32, 41), jresults[0].i32);
+}
+
+test "Linker host func on JIT (serci Z1c): Caller sees live guest memory" {
+    // (module (type (func (param i32) (result i32))) (import "env" "touch" (func (type 0)))
+    //         (memory 1)
+    //         (func (export "f") (param i32) (result i32)
+    //           local.get 0 i32.const 41 i32.store
+    //           local.get 0 call 0 local.set 1
+    //           local.get 0 i32.load local.get 1 i32.add))
+    // The host reads the stored i32, writes old+100 back, returns old+1, so
+    // f(0) == 42 + 141 == 183 on either engine.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+        0x02, 0x0d, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x05,
+        0x74, 0x6f, 0x75, 0x63, 0x68, 0x00, 0x00, 0x03,
+        0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x01, 0x0a,
+        0x1b, 0x01, 0x19, 0x01, 0x01, 0x7f, 0x20, 0x00,
+        0x41, 0x29, 0x36, 0x02, 0x00, 0x20, 0x00, 0x10,
+        0x00, 0x21, 0x01, 0x20, 0x00, 0x28, 0x02, 0x00,
+        0x20, 0x01, 0x6a, 0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    const H = struct {
+        fn touch(caller: *Caller, ptr: i32) i32 {
+            const mem = caller.memory() orelse return -1;
+            const w = mem.sliceAt(@intCast(ptr), 4) catch return -1;
+            const old = std.mem.readInt(i32, w[0..4], .little);
+            std.mem.writeInt(i32, w[0..4], old + 100, .little);
+            return old + 1;
+        }
+    };
+    try lk.defineFunc("env", "touch", fn (*Caller, i32) i32, H.touch);
+    for ([_]struct { eng: _api_instance.EngineKind, want: _api_instance.EngineKind }{
+        .{ .eng = .auto, .want = .interp },
+        .{ .eng = .jit, .want = .jit },
+    }) |leg| {
+        var inst = try lk.instantiate(&mod, .{ .engine = leg.eng });
+        defer inst.deinit();
+        try testing.expectEqual(leg.want, inst.engine());
+        var results = [_]_zwasm.Value{.{ .i32 = 0 }};
+        try inst.invoke("f", &.{.{ .i32 = 0 }}, &results);
+        try testing.expectEqual(@as(i32, 183), results[0].i32);
+    }
+}
+
+test "Linker host func on JIT (serci Z1c): defineFuncRaw computes" {
+    // (module (type (func (param i32 i32) (result i32))) (import "env" "add" (func (type 0)))
+    //         (func (export "f") (param i32 i32) (result i32) local.get 0 local.get 1 call 0))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+        0x7f, 0x02, 0x0b, 0x01, 0x03, 0x65, 0x6e, 0x76,
+        0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x03, 0x02,
+        0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66, 0x00,
+        0x01, 0x0a, 0x0a, 0x01, 0x08, 0x00, 0x20, 0x00,
+        0x20, 0x01, 0x10, 0x00, 0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    const H = struct {
+        fn add(caller: *Caller, args: []const _runtime.Value, results: []_runtime.Value) anyerror!void {
+            _ = caller;
+            results[0] = .{ .i32 = args[0].i32 + args[1].i32 };
+        }
+    };
+    const params = [_]_zir.ValType{ .i32, .i32 };
+    const res = [_]_zir.ValType{.i32};
+    try lk.defineFuncRaw("env", "add", null, &params, &res, H.add);
+    var jinst = try lk.instantiate(&mod, .{ .engine = .jit });
+    defer jinst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.jit, jinst.engine());
+    var results = [_]_zwasm.Value{.{ .i32 = 0 }};
+    try jinst.invoke("f", &.{ .{ .i32 = 2 }, .{ .i32 = 3 } }, &results);
+    try testing.expectEqual(@as(i32, 5), results[0].i32);
+}
+
+test "Linker host func on JIT (serci Z1c): FP-arg shape computes" {
+    // (module (type (func (param f32 f64) (result f64))) (import "env" "fadd" (func (type 0)))
+    //         (type (func (result f64)))
+    //         (func (export "f") (result f64) f32.const 1.5 f64.const 2.5 call 0))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x0b, 0x02, 0x60, 0x02, 0x7d, 0x7c, 0x01,
+        0x7c, 0x60, 0x00, 0x01, 0x7c, 0x02, 0x0c, 0x01,
+        0x03, 0x65, 0x6e, 0x76, 0x04, 0x66, 0x61, 0x64,
+        0x64, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x07,
+        0x05, 0x01, 0x01, 0x66, 0x00, 0x01, 0x0a, 0x14,
+        0x01, 0x12, 0x00, 0x43, 0x00, 0x00, 0xc0, 0x3f,
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x40, 0x10, 0x00, 0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    const H = struct {
+        fn fadd(caller: *Caller, a: f32, b: f64) f64 {
+            _ = caller;
+            return @as(f64, a) + b;
+        }
+    };
+    try lk.defineFunc("env", "fadd", fn (*Caller, f32, f64) f64, H.fadd);
+    var jinst = try lk.instantiate(&mod, .{ .engine = .jit });
+    defer jinst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.jit, jinst.engine());
+    var results = [_]_zwasm.Value{.{ .f64 = 0 }};
+    try jinst.invoke("f", &.{}, &results);
+    // Facade `Value.f64` carries bits; compare the bit pattern of 4.0.
+    try testing.expectEqual(@as(u64, @bitCast(@as(f64, 4.0))), results[0].f64);
+}
+
+test "Linker host func on JIT (serci Z1c): past-cover sig declines (.auto) / refuses (.jit)" {
+    // (module (type (func (param i32 x7) (result i32))) (import "env" "id7" (func (type 0)))
+    //         (func (export "f") (param i32) (result i32) local.get 0 call 0))
+    // Arity 7 is past the bridge (MAX_ARITY 6): `.auto` declines to interp
+    // (computes there), explicit `.jit` refuses LOUDLY. Same rule covers FP
+    // past 2 and v128 / ref shapes (bridge unit rows pin the classifier).
+    // (module (type (func (param i32 x7) (result i32))) (import "env" "id7" (func (type 0)))
+    //         (func (export "f") (param i32 x7) (result i32)
+    //           local.get 0 .. local.get 6 call 0))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x0c, 0x01, 0x60, 0x07, 0x7f, 0x7f, 0x7f,
+        0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, 0x02, 0x0b,
+        0x01, 0x03, 0x65, 0x6e, 0x76, 0x03, 0x69, 0x64,
+        0x37, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07,
+        0x05, 0x01, 0x01, 0x66, 0x00, 0x01, 0x0a, 0x14,
+        0x01, 0x12, 0x00, 0x20, 0x00, 0x20, 0x01, 0x20,
+        0x02, 0x20, 0x03, 0x20, 0x04, 0x20, 0x05, 0x20,
+        0x06, 0x10, 0x00, 0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    const H = struct {
+        fn id7(caller: *Caller, a0: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32) i32 {
+            _ = caller;
+            return a0 + a1 + a2 + a3 + a4 + a5 + a6;
+        }
+    };
+    try lk.defineFunc("env", "id7", fn (*Caller, i32, i32, i32, i32, i32, i32, i32) i32, H.id7);
+    // Instantiation, not the call, is under test (the `.auto` leg never
+    // invokes).
+    var inst = try lk.instantiate(&mod, .{ .engine = .auto });
+    defer inst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.interp, inst.engine());
     try testing.expectError(error.InstantiateFailed, lk.instantiate(&mod, .{ .engine = .jit }));
+}
+
+test "Linker host func on JIT (serci Z1c): Zig error becomes a guest trap" {
+    // Same bytes as the id row above: the host fails instead of computing.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+        0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x02,
+        0x69, 0x64, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00,
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x01, 0x0a,
+        0x08, 0x01, 0x06, 0x00, 0x20, 0x00, 0x10, 0x00,
+        0x0b,
+    };
+    var eng = try _zwasm.Engine.init(testing.allocator, .{});
+    defer eng.deinit();
+    var mod = try eng.compile(&bytes);
+    defer mod.deinit();
+    var lk = eng.linker();
+    defer lk.deinit();
+    const H = struct {
+        fn boom(caller: *Caller, x: i32) error{Boom}!i32 {
+            _ = caller;
+            _ = x;
+            return error.Boom;
+        }
+    };
+    try lk.defineFunc("env", "id", fn (*Caller, i32) error{Boom}!i32, H.boom);
+    var jinst = try lk.instantiate(&mod, .{ .engine = .jit });
+    defer jinst.deinit();
+    try testing.expectEqual(_api_instance.EngineKind.jit, jinst.engine());
+    var results = [_]_zwasm.Value{.{ .i32 = 0 }};
+    // Host-originated, like the bridge's trapResult: HostTrap, not a crash.
+    try testing.expectError(error.HostTrap, jinst.invoke("f", &.{.{ .i32 = 1 }}, &results));
 }
 
 test "Linker.defineWasi: WasiConfig.preopens materialise into the host at instantiate (D-177)" {

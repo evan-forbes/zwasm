@@ -84,3 +84,42 @@ engines) and RT1 (wasmtime-vs-fork differential) stay green.
   the JIT and fails loud. Full suite: 3357 passed, 12 skipped (`zig build test`); `test-all` green.
 - Compatibility: default (`.auto`) behavior is byte-identical to pre-Z1b;
   only an explicit `.jit` can observe the new path.
+
+## Z1c — Linker host funcs run on the JIT with a JIT-backed `Caller` (serci Z1, third increment)
+
+- Status: on `fork/z1c-linker-host-jit`; upstream PR: (to be opened as the
+  next increment on #468 / #469).
+- What: Z1b routed explicit-`.jit` Linker instantiations to the JIT but left
+  `defineFunc` host imports refusing loudly — the native marshal thunks were
+  not JIT-bridge payloads, and a JIT-backed `Caller` did not exist. Now an
+  explicit-`.jit` `Linker.instantiate` plants `{ hostFuncThunk,
+  jit_payload }` for each host-func import (`.auto` / `.interp` keep the
+  marshal-thunk bindings, byte-identical), and the native-facade JIT path
+  serves them through the existing `dispatchPtrFor` bridge like C host funcs.
+- How: each `defineFunc` / `defineFuncCtx` / `defineFuncRaw` entry owns a
+  `HostFuncPayload` with a `callback_jit` adapter (per-`Sig` generated, or the
+  shared runtime-arity one) and the entry ctx as `env`. The bridge prefers
+  `callback_jit` over the ValVec-only C callbacks; the adapter builds a
+  JIT-backed `Caller` from the calling instance's live `*JitRuntime`
+  (`Caller.Backing.jit`, `Memory.Backing.jit_rt` — memory re-read per access,
+  `grow` via the block's own grow callout, allocator stashed at `defineFunc`
+  time) and marshals `Val` args / results per the Zig signature. A Zig
+  `error` raises the host-originated trap directly (`trap_flag = 1`,
+  `trap_kind = 19`, the bridge `trapResult` code) since there is no trap
+  object to return. Coverage is the bridge's standing rule — all-GP 0..6 or
+  <=2 scalars with FP, single scalar/void result: 7+ args, FP past 2,
+  v128 / ref, and multi-result still decline (`.auto` → interp; explicit
+  `.jit` refuses loudly), and WASI-importing modules still refuse loudly
+  under `.jit` (the store-plant slice is not this change).
+- Drive-by fix: `zigToRuntime`'s `f32` / `f64` arms mistook a widening `@as`
+  for a `@bitCast` (latent — no in-tree float-returning host fn ever
+  instantiated them; the new FP row is the first). Both arms corrected.
+- Tests: six `Linker host func on JIT` rows in `src/zwasm/linker.zig` (id on
+  `.jit` computes + reports `jit`; `Caller` live-memory read/write;
+  `defineFuncRaw`; FP-arg shape; 7-arg decline/refuse; Zig error →
+  `error.HostTrap`) plus a bridge decline row (FP past 2, v128 / ref,
+  multi-result). Full suite: `zig build test` green; `test-all` green
+  (diff_runner 57/57 vs wasmtime on both engines; fuzz_exec 0 mismatched).
+- Compatibility: `.auto` / `.interp` paths untouched; only explicit `.jit`
+  with a host-func import observes the new path (previously a loud
+  `InstantiateFailed`, now a computing JIT instance).

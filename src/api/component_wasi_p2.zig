@@ -443,7 +443,7 @@ test "D-444 II: p2ResourceDrop(HTTP_REQUEST_RT) — releases transferred ends + 
     p3h.installP3Hooks(&ctx); // the drop path below reaches P3 via the hooks
     var rt = Runtime.init(testing.allocator);
     defer rt.deinit();
-    var caller: Caller = .{ .rt = &rt, .host_data = &ctx };
+    var caller: Caller = .{ .backing = .{ .interp = &rt }, .host_data = &ctx };
 
     // A request carrying transferred body ends + owned headers/uri storage,
     // exactly the state a guest hands over before dropping the resource.

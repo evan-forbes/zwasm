@@ -23,6 +23,7 @@ const runtime_instance = @import("../runtime/instance/instance.zig");
 const zir = @import("../ir/zir.zig");
 const vec = @import("vec.zig");
 const trap_surface = @import("trap_surface.zig");
+const jit_abi = @import("../engine/codegen/shared/jit_abi.zig");
 
 const Instance = runtime_instance.Instance;
 const Store = runtime.Store;
@@ -66,6 +67,14 @@ pub const Func = struct {
 pub const WasmFuncCallback = *const fn (args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap;
 pub const WasmFuncCallbackEnv = *const fn (env: ?*anyopaque, args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap;
 
+/// serci Z1c — JIT-Caller callback ABI for NATIVE-`Linker` host funcs. Same
+/// ownership as the C callbacks (null trap = success, owned trap = guest
+/// fault), plus the calling JIT instance's live `*JitRuntime` so the adapter
+/// can build a JIT-backed `Caller` (memory + allocator) per call. Set ONLY on
+/// Linker-synthesised payloads; the C path (`wasm_func_new`) never sets it,
+/// and the JIT bridge prefers it over `callback` / `callback_env` when set.
+pub const WasmFuncCallbackJit = *const fn (env: ?*anyopaque, jrt: *jit_abi.JitRuntime, args: ?*const ValVec, results: ?*ValVec) callconv(.c) ?*Trap;
+
 /// Backing for a host-created func (`wasm_func_new[_with_env]`).
 /// `callback` XOR `callback_env` is set. `params`/`results` are owned
 /// `zir.ValType` slices (the marshalled arity). #439 — the STORE owns this,
@@ -77,6 +86,10 @@ pub const HostFuncPayload = struct {
     finalizer: ?*const fn (?*anyopaque) callconv(.c) void = null,
     params: []zir.ValType,
     results: []zir.ValType,
+    /// serci Z1c — JIT-Caller adapter (native `Linker` host funcs only; the C
+    /// path leaves this null). The bridge calls it INSTEAD of `callback` /
+    /// `callback_env` so the host fn runs with a JIT-backed `Caller`.
+    callback_jit: ?WasmFuncCallbackJit = null,
 };
 
 /// `wasm_global_t` — opaque-from-C handle for a global instance.

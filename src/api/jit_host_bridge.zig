@@ -156,8 +156,16 @@ fn invokeCb(rt: *JitRuntime, payload: *HostFuncPayload, args: []const Val, compt
     const nr = payload.results.len;
     var args_vec: ValVec = .{ .size = args.len, .data = if (args.len > 0) @constCast(args.ptr) else null };
     var res_vec: ValVec = .{ .size = nr, .data = if (nr > 0) &res_storage else null };
+    // serci Z1c — a Linker-synthesised payload carries a JIT-Caller adapter:
+    // prefer it over the ValVec-only C callbacks so the host fn runs with a
+    // JIT-backed `Caller`. The adapter may set `trap_flag` itself (a Zig
+    // `error` has no trap object to return) and return null; the epilogue's
+    // post-call check raises it like any bridge trap, and the sentinel below
+    // is discarded either way.
     const trap: ?*Trap =
-        if (payload.callback_env) |cb|
+        if (payload.callback_jit) |cb|
+            cb(payload.env, rt, &args_vec, &res_vec)
+        else if (payload.callback_env) |cb|
             cb(payload.env, &args_vec, &res_vec)
         else if (payload.callback) |cb|
             cb(&args_vec, &res_vec)
@@ -396,4 +404,24 @@ test "dispatchPtrFor: all-GP arity 5..6 covered, 7 declined (serci Z1)" {
     try std.testing.expect(dispatchPtrFor(&five, &r32, MAX_HOST_SLOTS) == null);
     // Distinct slots resolve distinct thunks (no aliasing across K).
     try std.testing.expect(dispatchPtrFor(&five, &r32, 0).? != dispatchPtrFor(&five, &r32, 1).?);
+}
+
+test "dispatchPtrFor: FP past 2, v128/ref, multi-result decline (serci Z1c)" {
+    // The bridge's standing coverage: all-GP 0..6, or <=2 scalar args with
+    // >=1 FP. Everything else declines (the caller falls back to `.interp`;
+    // explicit `.jit` refuses loudly). None of these shapes may resolve.
+    const r32 = [_]zir.ValType{.i32};
+    const f3 = [_]zir.ValType{ .f32, .f32, .f32 };
+    const gp7fp = [_]zir.ValType{ .i32, .i32, .i32, .i32, .i32, .i32, .f64 };
+    const v128p = [_]zir.ValType{.v128};
+    const refp = [_]zir.ValType{.{ .ref = zir.RefType.abs(.func, true) }};
+    const v128r = [_]zir.ValType{.v128};
+    const two_res = [_]zir.ValType{ .i32, .i32 };
+    try std.testing.expect(dispatchPtrFor(&f3, &r32, 0) == null); // FP past arity 2
+    try std.testing.expect(dispatchPtrFor(&gp7fp, &r32, 0) == null); // 7 args even with FP tail
+    try std.testing.expect(dispatchPtrFor(&v128p, &.{}, 0) == null); // v128 param
+    try std.testing.expect(dispatchPtrFor(&refp, &.{}, 0) == null); // ref param
+    try std.testing.expect(dispatchPtrFor(&.{}, &v128r, 0) == null); // v128 result
+    try std.testing.expect(dispatchPtrFor(&.{}, &two_res, 0) == null); // multi-result
+    try std.testing.expect(dispatchPtrFor(&.{.i32}, &two_res, 0) == null);
 }

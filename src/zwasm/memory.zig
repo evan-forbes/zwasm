@@ -11,6 +11,7 @@ const std = @import("std");
 
 const _runtime = @import("../runtime/runtime.zig");
 const _runner = @import("../engine/runner.zig"); // ADR-0200 JIT engine (Zone 2; `lib`-exempt)
+const _jit_abi = @import("../engine/codegen/shared/jit_abi.zig"); // serci Z1c: `*JitRuntime` backing (same Zone 2 exemption)
 
 pub const Memory = struct {
     /// Engine the view reads through (ADR-0200 increment 5). Interp wraps
@@ -21,6 +22,11 @@ pub const Memory = struct {
     pub const Backing = union(enum) {
         interp: *_runtime.Runtime,
         jit: *_runner.JitInstance,
+        /// serci Z1c — the calling JIT instance's live runtime block, held by
+        /// a JIT-backed `Caller` (the bridge thunk's `rt`). Re-read on every
+        /// access like the `.jit` arm; `grow` goes through the block's own
+        /// `memory_grow_fn`, which keeps `vm_base` / `mem_limit` in sync.
+        jit_rt: *_jit_abi.JitRuntime,
     };
 
     pub const Error = error{ OutOfBoundsLoad, OutOfBoundsStore };
@@ -30,6 +36,7 @@ pub const Memory = struct {
         return switch (self.backing) {
             .interp => |rt| rt.memory,
             .jit => |jit| jit.owned.rt.vm_base[0..jit.owned.rt.mem_limit],
+            .jit_rt => |jrt| jrt.vm_base[0..jrt.mem_limit],
         };
     }
 
@@ -98,6 +105,14 @@ pub const Memory = struct {
                 return @intCast(old_pages);
             },
             .jit => |jit| return jit.growMemory(delta),
+            .jit_rt => |jrt| {
+                // The block's own grow callout keeps vm_base/mem_limit in
+                // sync on success; a negative return is a refusal (null, the
+                // same recoverable outcome as the other arms).
+                const prev = jrt.memory_grow_fn(jrt, delta);
+                if (prev < 0) return null;
+                return @intCast(prev);
+            },
         }
     }
 };

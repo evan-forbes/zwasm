@@ -2093,12 +2093,21 @@ fn allocRefHandle(rm: ?RefMarshalCtx, payload: u64) ?*anyopaque {
 }
 
 /// `HostCall` fn_ptr for a `wasm_func_new` host callback (wired by the
-/// buildBindings host-func arm). Marshals the guest's operand-stack args
+/// buildBindings host-func arm).
+///
+/// serci Z1c — ALSO the marker the native `Linker` plants for a host-func
+/// import it instantiates with explicit `.jit`: the Linker emits
+/// `{ hostFuncThunk, jit_payload }` (its per-entry `HostFuncPayload` with a
+/// `callback_jit` adapter), and the native-facade JIT path below accepts the
+/// marker as "embedder host func described by payload" and routes it through
+/// `dispatchPtrFor` like a C host func. The interp thunk itself never runs on
+/// the JIT path; the marker is only compared by pointer. Marshals the guest's
+/// operand-stack args
 /// (top `params.len`, left-to-right) into a `wasm_val_vec_t`, invokes the
 /// C callback, and pushes the marshalled results. A non-null returned
 /// `wasm_trap_t*` becomes a guest trap. Runtime-arity twin of the comptime
 /// `host_func_marshal` native thunk (ADR-0109).
-fn hostFuncThunk(rt: *runtime.Runtime, ctx: *anyopaque) anyerror!void {
+pub fn hostFuncThunk(rt: *runtime.Runtime, ctx: *anyopaque) anyerror!void {
     const p: *HostFuncPayload = @ptrCast(@alignCast(ctx));
     const np: u32 = @intCast(p.params.len);
     const nr = p.results.len;
